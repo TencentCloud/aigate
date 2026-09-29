@@ -1,0 +1,2981 @@
+openapi: 3.0.3
+
+info:
+  title: Tencent Cloud AIGate
+  version: 0.1.0
+  description: |
+    Tencent Cloud AIGate 是自托管的 LLM API 网关，纯 API 服务（无 Web UI）。三个平面：
+
+    - **数据面** `/v1/*`：以数据面密钥（`sk-…`）经 `Authorization: Bearer` 鉴权；
+      `/v1/messages` 额外接受 `x-api-key` 头（二者并存时 `x-api-key` 优先）。
+    - **管理面** `/admin/*`：以 `role=admin` 用户的访问 token（`gk-…`）经 `Authorization: Bearer` 鉴权。
+    - **用户面** `/api/user/*`：任意启用用户（`user` / `admin`）的访问 token 均可访问，`user` 角色强制行级隔离到本人。
+    - **健康检查** `/healthz`：无需鉴权。
+
+    约定：
+
+    - 所有错误（除 Anthropic 风格的 `/v1/messages`）统一为 `ErrorResponse`，`code` 等于 HTTP 状态码。
+    - 请求体上限 1 MiB：超限**直接拒绝、不截断**——数据面 413、管理面/用户面 400，文案均为 `request body too large`；空请求体返回 400。
+    - 数据面 `/v1/*` 的上游成功响应体**原样透传**（本文件中的响应 schema 仅示意），
+      上游错误状态码与响应体同样原样透传。
+    - 数据面 `/v1/messages` 的错误统一为 Anthropic 风格 `AnthropicErrorResponse`。
+    - 配额超限返回配置的状态码（默认 429）并带 `Retry-After` 头；`/v1/messages` 用
+      `rate_limit_error`，其余数据面路由用 `ErrorResponse`。
+
+tags:
+  - name: health
+    description: 健康检查（无鉴权）
+  - name: data-plane
+    description: 数据面（`sk-` 数据面密钥）
+  - name: admin
+    description: 管理面（`admin` 角色访问 token）
+  - name: user
+    description: 用户面（本人身份与用量）
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: 本地默认监听地址
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      summary: 健康检查
+      security: []
+      responses:
+        '200':
+          description: 服务存活
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+  /v1/chat/completions:
+    post:
+      tags: [data-plane]
+      summary: OpenAI 兼容的对话补全（流式 / 非流式）
+      description: |
+        把 OpenAI Chat Completions 请求转发给密钥绑定命中的上游模型。
+        网关只读取并改写 `model`、`stream`、`max_tokens`、`max_completion_tokens`，其余字段原样转发。
+
+        模型解析：请求显式给出 `model` 时按大小写不敏感匹配（`/`、`:` 与 `-` 等价）命中的启用绑定；
+        同名模型存在多个来源时，可用 `provider/model_id` 前缀精确指定来源——前缀既可为 provider 名
+        （如 `qcloudlkeap/deepseek-v3.2`），也可为保存绑定时生成的拼接形态 `{provider}-{model_id}`
+        （如 `hatchery-glm-4-plus/glm-4-plus`）。显式给出 `model`（含前缀）而未命中时返回 400 且
+        **不回退** primary；未给出 `model` 时使用绑定的 `primary`。
+
+        成功的非流式响应与上游状态码、响应体**原样透传**；`stream: true` 时以
+        `text/event-stream` 增量返回并以 `data: [DONE]` 收尾。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionRequest'
+      responses:
+        '200':
+          description: |
+            上游的 200 响应（非流式原样透传；流式为 SSE）。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatCompletionResponse'
+            text/event-stream:
+              schema:
+                type: string
+                description: 'SSE 分片流，以 `data: [DONE]` 结束'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/BodyTooLarge'
+        '429':
+          $ref: '#/components/responses/QuotaExceeded'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          description: 非流式：无法连接上游（DNS / 连接 / TLS / 超时）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/models:
+    get:
+      tags: [data-plane]
+      summary: 列出密钥可用的模型
+      description: |
+        以 OpenAI list 格式返回密钥绑定的**启用**模型，按小写 `model_id` 去重。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 模型列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIModelList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/messages:
+    post:
+      tags: [data-plane]
+      summary: Anthropic Messages 入站（文本 / 工具 / 图片，流式 / 非流式）
+      description: |
+        Anthropic Messages 原生入站。鉴权接受 `x-api-key: sk-…` 或 `Authorization: Bearer sk-…`，
+        两者并存时 `x-api-key` 优先；凭据无效或缺失返回 401 `authentication_error`。
+
+        请求校验：`model` 必填、`max_tokens` 必填且 > 0，否则 400 `invalid_request_error`；
+        未知字段忽略（前向兼容）。
+
+        上游按命中模型的 `model_type` 走两条路径：
+
+        - `openai-completions`：请求转换为 OpenAI 格式（`system` → system 消息、图片转 data URI、
+          `tool_use`/`tool_result` → `tool_calls`/`role=tool`、`tools`/`tool_choice`/`stop_sequences` 映射），
+          响应与流式 SSE 回译为 Anthropic 事件序列
+          （`message_start` → `content_block_start` → `content_block_delta`* → `content_block_stop` → `message_delta` → `message_stop`）。
+        - `anthropic-messages`：仅替换 `model` 与施加密钥 `max_tokens` 上限，其余字段与上游响应（含 SSE）原样直通。
+
+        复用三级配额（全局 → 模型 → 用户），超限返回 429 + `Retry-After`（`rate_limit_error`），且不访问上游。
+      security:
+        - bearerAuth: []
+        - apiKeyHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnthropicMessagesRequest'
+      responses:
+        '200':
+          description: Anthropic 消息响应（流式时为 Anthropic SSE 事件序列）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnthropicMessagesResponse'
+            text/event-stream:
+              schema:
+                type: string
+                description: Anthropic SSE 事件序列，以 `message_stop` 结束
+        '400':
+          $ref: '#/components/responses/AnthropicBadRequest'
+        '401':
+          $ref: '#/components/responses/AnthropicUnauthorized'
+        '413':
+          $ref: '#/components/responses/AnthropicBodyTooLarge'
+        '429':
+          $ref: '#/components/responses/AnthropicQuotaExceeded'
+        '500':
+          $ref: '#/components/responses/AnthropicInternalError'
+        '502':
+          $ref: '#/components/responses/AnthropicUpstreamError'
+
+  /admin/models:
+    get:
+      tags: [admin]
+      summary: 列出全部模型
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 模型列表（无模型时为空数组）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [admin]
+      summary: 创建模型
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelCreateRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Model'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/models/{id}:
+    parameters:
+      - $ref: '#/components/parameters/PathID'
+    get:
+      tags: [admin]
+      summary: 查询模型
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 模型
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Model'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [admin]
+      summary: 局部更新模型
+      description: 仅更新请求中出现的字段。`api_key` 仅在非空时生效（空串为 no-op，凭据无法清空）。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelUpdateRequest'
+      responses:
+        '200':
+          description: 更新后的模型
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Model'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [admin]
+      summary: 删除模型
+      description: 同时清理引用该模型的全部密钥绑定。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ok'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/models/{id}/connectivity:
+    parameters:
+      - $ref: '#/components/parameters/PathID'
+    post:
+      tags: [admin]
+      summary: 模型连通性测试
+      description: |
+        以最小请求（单条 user 消息、`max_tokens=1`）探测上游，验证地址可达、凭据有效且模型可调用。
+
+        **探测结果一律以 HTTP 200 返回**，成功/失败体现在 body 的 `ok`：
+
+        - 成功：`{"ok":true,"latency_ms":N}`（毫秒，取整且为正）；
+        - 失败：`{"ok":false,"error_kind":"…","message":"…"}`，`error_kind` 为封闭枚举
+          `network_unreachable` / `invalid_api_key` / `forbidden` / `rate_limited` /
+          `upstream_server` / `upstream_client`。
+
+        出站复用数据面一致的 SSRF 防护；默认严格模式下私网/回环地址会被拦截并归类为
+        `network_unreachable`，需要放行时启动加 `-allow-private-upstreams`。
+
+        仅路径 id 非法（400）与模型不存在（404）走统一错误体。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 探测结果（成功或失败）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectivityResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/credentials:
+    get:
+      tags: [admin]
+      summary: 列出全部凭据
+      description: 响应中的 `secrets[].value` 恒为掩码，绝不回显明文。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 凭据列表（无凭据时为空数组）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [admin]
+      summary: 创建凭据
+      description: |
+        凭据是一组密钥项，被模型的 `credential_id` 引用后在转发时实时解析（不使用快照）。
+        密钥项 `key` 必填，`location` 仅支持 `header`（省略/空串按 `header` 处理）；返回 201 且 secrets 为掩码。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CredentialCreateRequest'
+      responses:
+        '201':
+          description: 已创建的凭据（secrets 掩码）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Credential'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/credentials/{id}:
+    parameters:
+      - $ref: '#/components/parameters/PathID'
+    get:
+      tags: [admin]
+      summary: 读取单个凭据
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 凭据（secrets 掩码）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Credential'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [admin]
+      summary: 局部更新凭据
+      description: 仅出现的字段被修改；`secrets` 出现时整体替换，不传则保持不变。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CredentialUpdateRequest'
+      responses:
+        '200':
+          description: 更新后的凭据（secrets 掩码）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Credential'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [admin]
+      summary: 删除凭据
+      description: 仍被模型（`ai_models.credential_id`）引用时返回 409，需先解除引用。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ok'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/keys:
+    get:
+      tags: [admin]
+      summary: 列出全部密钥
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 密钥列表（不含明文 token）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [admin]
+      summary: 创建密钥
+      description: 响应中的 `token` 为一次性明文，仅此一次返回。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KeyCreateRequest'
+      responses:
+        '201':
+          description: 已创建（`token` 为一次性明文）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Key'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/keys/{id}:
+    parameters:
+      - $ref: '#/components/parameters/PathID'
+    get:
+      tags: [admin]
+      summary: 查询密钥
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 密钥（不含明文 token）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Key'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [admin]
+      summary: 局部更新密钥
+      description: '`bindings` 出现时整体替换（`[]` 清空）；`user_id` 与 `group_id` 不可更新。'
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KeyUpdateRequest'
+      responses:
+        '200':
+          description: 更新后的密钥
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Key'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [admin]
+      summary: 删除密钥
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ok'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/keys/{id}/rotate:
+    parameters:
+      - $ref: '#/components/parameters/PathID'
+    post:
+      tags: [admin]
+      summary: 换发密钥
+      description: 生成新的 `sk-` 凭据并立即失效旧凭据；绑定与设置保留。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 换发后的密钥（`token` 为一次性明文）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Key'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/users:
+    get:
+      tags: [admin]
+      summary: 列出全部用户
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 用户列表（不含明文 token）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [admin]
+      summary: 创建用户
+      description: 响应中的 `token` 为一次性明文访问 token（`gk-…`），仅此一次返回。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreateRequest'
+      responses:
+        '201':
+          description: 已创建（`token` 为一次性明文）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/users/{id}:
+    parameters:
+      - $ref: '#/components/parameters/PathID'
+    put:
+      tags: [admin]
+      summary: 局部更新用户
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserUpdateRequest'
+      responses:
+        '200':
+          description: 更新后的用户
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [admin]
+      summary: 删除用户
+      description: 级联删除该用户的密钥与绑定；历史用量日志保留。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ok'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/users/{id}/rotate:
+    parameters:
+      - $ref: '#/components/parameters/PathID'
+    post:
+      tags: [admin]
+      summary: 换发用户访问 token
+      description: 生成新的访问 token 并立即失效旧 token。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 换发后的用户（`token` 为一次性明文）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/user-groups:
+    get:
+      tags: [admin]
+      summary: 列出全部分组
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 分组列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [admin]
+      summary: 创建分组
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GroupCreateRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Group'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/user-groups/{id}:
+    parameters:
+      - $ref: '#/components/parameters/PathID'
+    get:
+      tags: [admin]
+      summary: 查询分组
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 分组
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Group'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [admin]
+      summary: 局部更新分组
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GroupUpdateRequest'
+      responses:
+        '200':
+          description: 更新后的分组
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Group'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [admin]
+      summary: 删除分组
+      description: 仅删除分组本身，不级联用户/密钥；悬空引用按「分组不存在」回退全局默认规则。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ok'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/usage/summary:
+    get:
+      tags: [admin]
+      summary: 用量聚合查询
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/GroupBy'
+        - $ref: '#/components/parameters/StartDate'
+        - $ref: '#/components/parameters/EndDate'
+        - $ref: '#/components/parameters/FilterUserID'
+        - $ref: '#/components/parameters/FilterGroupID'
+        - $ref: '#/components/parameters/FilterAPIKeyID'
+        - $ref: '#/components/parameters/FilterAIModelID'
+      responses:
+        '200':
+          description: 聚合结果（无数据时 `rows` 为空数组）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageSummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/usage/logs:
+    get:
+      tags: [admin]
+      summary: 用量明细查询
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/StartDate'
+        - $ref: '#/components/parameters/EndDate'
+        - $ref: '#/components/parameters/FilterUserID'
+        - $ref: '#/components/parameters/FilterGroupID'
+        - $ref: '#/components/parameters/FilterAPIKeyID'
+        - $ref: '#/components/parameters/FilterAIModelID'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 明细分页（按时间倒序）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageLogs'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/usage/export:
+    get:
+      tags: [admin]
+      summary: 用量明细导出（CSV / JSON）
+      description: |
+        以文件流导出用量明细（字段与 `/admin/usage/logs` 一致）；过滤参数同源；
+        按批流式写出，不会整表载入内存。
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [csv, json]
+            default: csv
+          description: 导出格式；缺省 `csv`，非法值返回 400
+        - $ref: '#/components/parameters/StartDate'
+        - $ref: '#/components/parameters/EndDate'
+        - $ref: '#/components/parameters/FilterUserID'
+        - $ref: '#/components/parameters/FilterGroupID'
+        - $ref: '#/components/parameters/FilterAPIKeyID'
+        - $ref: '#/components/parameters/FilterAIModelID'
+      responses:
+        '200':
+          description: |
+            导出文件：`text/csv` 附件，或 `{"logs": [...]}` 流式 JSON。
+          content:
+            text/csv:
+              schema:
+                type: string
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageLogs'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/settings:
+    get:
+      tags: [admin]
+      summary: 读取全局设置
+      description: 首次访问时创建默认行（`"[]"`、`"[]"`、`site`）。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 全局设置
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Settings'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    put:
+      tags: [admin]
+      summary: 局部更新全局设置
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SettingsUpdateRequest'
+      responses:
+        '200':
+          description: 更新后的全局设置
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Settings'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/import:
+    post:
+      tags: [admin]
+      summary: 存量一次性导入（分组 / 用户 / 模型 / 密钥）
+      description: |
+        按 `user_groups → users → models → keys` 顺序导入，后者的引用可指向本次刚创建的实体。
+
+        幂等键：`user_groups.name`、`users.name`、`models.(provider,model_id)`、`keys.token`（哈希后比较）；
+        已存在记 `skipped`，重复导入不产生重复数据。
+
+        单条失败（引用缺失、字段非法、配额规则非法）以 `details[].action=error` 记录并继续处理其余条目；
+        请求本身成功即返回 200，逐条结果在 `summary` / `details` 中。
+
+        `dry_run=true` 只返回将执行的动作计划而不写库。
+
+        `keys[].token` 为明文，导入时立即转为哈希与前缀存储；**明文不落库、不出现在响应或日志中**
+        （`details[].ref` 仅为展示前缀）。
+
+        导入的用户**不返回**访问 token（内部生成随机 token 后丢弃明文），需要时用
+        `POST /admin/users/{id}/rotate` 换发。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportRequest'
+      responses:
+        '200':
+          description: 导入结果（逐条明细）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/webhooks:
+    get:
+      tags: [admin]
+      summary: 列出全部 webhook 订阅
+      description: 响应中的 `secret` 恒为掩码（只写不读回）。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 订阅列表（无订阅时为空数组）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [admin]
+      summary: 创建 webhook 订阅
+      description: |
+        `url` 必须是可解析的 `http`/`https` 地址；`event_types` 为事件类型数组，
+        空数组（或省略）表示订阅全部；`secret` 用于 HMAC 签名且只写不读回。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookCreateRequest'
+      responses:
+        '201':
+          description: 已创建的订阅（secret 掩码）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/webhooks/{id}:
+    parameters:
+      - $ref: '#/components/parameters/PathID'
+    get:
+      tags: [admin]
+      summary: 读取单个 webhook 订阅
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 订阅（secret 掩码）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [admin]
+      summary: 局部更新 webhook 订阅
+      description: |
+        仅出现的字段被修改。`secret` 为空串表示保持原值（该字段不可读回，无法用空值清空）；
+        `event_types` 出现时整体替换。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookUpdateRequest'
+      responses:
+        '200':
+          description: 更新后的订阅（secret 掩码）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [admin]
+      summary: 删除 webhook 订阅
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ok'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/webhooks/{id}/deliveries:
+    parameters:
+      - $ref: '#/components/parameters/PathID'
+    get:
+      tags: [admin]
+      summary: 查询订阅的投递记录
+      description: |
+        按时间倒序分页返回投递记录，用于排查投递失败（`status`/`attempts`/`last_status`/`last_error`）。
+        投递语义见文档附录（至多 3 次尝试、1s/5s 退避、HMAC 签名）。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 投递记录分页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeliveryList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/user/me:
+    get:
+      tags: [user]
+      summary: 当前身份
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 当前用户（含分组名）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/user/quota:
+    get:
+      tags: [user]
+      summary: 配额逐条视图
+      description: |
+        返回目标用户生效规则的窗口与用量。`user` 角色强制查询本人（请求中的 `user_id` 一律忽略）；
+        `admin` 角色可用 `?user_id=` 指定任意用户，缺省为自己。
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: user_id
+          in: query
+          required: false
+          description: 目标用户 ID（仅 admin 角色有效）
+          schema:
+            type: integer
+            format: uint
+      responses:
+        '200':
+          description: 配额视图（无规则时 `usages` 为空数组）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuotaView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/user/usage/summary:
+    get:
+      tags: [user]
+      summary: 本人用量聚合
+      description: 行级隔离：`user` 角色强制 `user_id` 为本人；`admin` 可用 `?user_id=` 指定，缺省为自己。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/GroupBy'
+        - $ref: '#/components/parameters/StartDate'
+        - $ref: '#/components/parameters/EndDate'
+        - $ref: '#/components/parameters/FilterUserID'
+        - $ref: '#/components/parameters/FilterGroupID'
+        - $ref: '#/components/parameters/FilterAPIKeyID'
+        - $ref: '#/components/parameters/FilterAIModelID'
+      responses:
+        '200':
+          description: 聚合结果（无数据时 `rows` 为空数组）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageSummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/user/usage/logs:
+    get:
+      tags: [user]
+      summary: 本人用量明细
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/StartDate'
+        - $ref: '#/components/parameters/EndDate'
+        - $ref: '#/components/parameters/FilterUserID'
+        - $ref: '#/components/parameters/FilterGroupID'
+        - $ref: '#/components/parameters/FilterAPIKeyID'
+        - $ref: '#/components/parameters/FilterAIModelID'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: 明细分页（按时间倒序）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageLogs'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/user/usage/by-model:
+    get:
+      tags: [user]
+      summary: 本人按模型聚合的用量
+      description: 与 `usage/summary` 同源，固定按 `model` 聚合（忽略 `group_by`）。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/StartDate'
+        - $ref: '#/components/parameters/EndDate'
+        - $ref: '#/components/parameters/FilterUserID'
+        - $ref: '#/components/parameters/FilterGroupID'
+        - $ref: '#/components/parameters/FilterAPIKeyID'
+        - $ref: '#/components/parameters/FilterAIModelID'
+      responses:
+        '200':
+          description: 按模型聚合结果（`group_by` 固定为 `model`）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageSummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/user/keys:
+    get:
+      tags: [user]
+      summary: 列出目标用户名下的自助密钥
+      description: |
+        `user` 角色强制作用于本人；`admin` 角色可用 `?user_id=` 指定用户，缺省为自己。
+        响应不含明文 token。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FilterUserID'
+      responses:
+        '200':
+          description: 密钥列表（无密钥时为空数组）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [user]
+      summary: 创建自助密钥
+      description: |
+        校验顺序：数量上限（`settings.user_key_limit`，默认 5；`0` = 不限，超限 400
+        `key limit reached (limit N)`）→ 模型范围（只能绑定该用户名下任意已有密钥出现过的模型，
+        否则 400）→ 落库。返回 201 与一次性明文 `sk-` token。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FilterUserID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserKeyCreateRequest'
+      responses:
+        '201':
+          description: 已创建的密钥（`token` 为一次性明文）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Key'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/user/keys/{id}:
+    parameters:
+      - $ref: '#/components/parameters/PathID'
+    get:
+      tags: [user]
+      summary: 读取单个自助密钥
+      description: 密钥不存在或不属于目标用户时统一返回 404，避免通过 id 探测。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FilterUserID'
+      responses:
+        '200':
+          description: 密钥（不含明文 token）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Key'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [user]
+      summary: 局部更新自助密钥
+      description: 仅出现的字段被修改；`bindings` 出现时整体替换并重新做模型范围校验。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FilterUserID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserKeyUpdateRequest'
+      responses:
+        '200':
+          description: 更新后的密钥（不含明文 token）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Key'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [user]
+      summary: 删除自助密钥
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FilterUserID'
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ok'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/user/keys/{id}/usage:
+    parameters:
+      - $ref: '#/components/parameters/PathID'
+    get:
+      tags: [user]
+      summary: 单密钥用量趋势（按日）
+      description: |
+        单个密钥的按日用量聚合；`user` 角色只能查询自己名下的密钥（其余 404），
+        `admin` 可用 `?user_id=` 查询任意密钥；未提供 start/end 时默认最近 30 天。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/StartDate'
+        - $ref: '#/components/parameters/EndDate'
+        - $ref: '#/components/parameters/FilterUserID'
+      responses:
+        '200':
+          description: 按日趋势
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageSummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/user/keys/{id}/rotate:
+    parameters:
+      - $ref: '#/components/parameters/PathID'
+    post:
+      tags: [user]
+      summary: 换发自助密钥
+      description: 换发新的 `sk-` 明文并立即使旧凭据失效；绑定与设置保留。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FilterUserID'
+      responses:
+        '200':
+          description: 密钥（`token` 为一次性明文）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Key'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer <token>`。数据面用数据面密钥 `sk-…`；
+        管理面/用户面用访问 token `gk-…`（管理面要求 `role=admin`）。
+    apiKeyHeader:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: |
+        仅 `POST /v1/messages` 支持：以 `sk-…` 数据面密钥替代 `Authorization` 头；
+        二者并存时 `x-api-key` 优先。
+
+  parameters:
+    PathID:
+      name: id
+      in: path
+      required: true
+      description: 资源 ID（正整数；非数字或 0 返回 400）
+      schema:
+        type: integer
+        format: uint
+        minimum: 1
+    GroupBy:
+      name: group_by
+      in: query
+      required: false
+      description: 聚合维度，缺省 `date`
+      schema:
+        type: string
+        enum: [date, model, key, user, group]
+        default: date
+    StartDate:
+      name: start
+      in: query
+      required: false
+      description: 起始日期（含），`YYYY-MM-DD`，按业务时区解释
+      schema:
+        type: string
+        pattern: '^\d{4}-\d{2}-\d{2}$'
+    EndDate:
+      name: end
+      in: query
+      required: false
+      description: 结束日期（含当日），`YYYY-MM-DD`，按业务时区解释
+      schema:
+        type: string
+        pattern: '^\d{4}-\d{2}-\d{2}$'
+    FilterUserID:
+      name: user_id
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: uint
+    FilterGroupID:
+      name: group_id
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: uint
+    FilterAPIKeyID:
+      name: api_key_id
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: uint
+    FilterAIModelID:
+      name: ai_model_id
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: uint
+    Page:
+      name: page
+      in: query
+      required: false
+      description: 页码，从 1 开始，缺省 1
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSize:
+      name: page_size
+      in: query
+      required: false
+      description: 每页条数，缺省 50，上限 500
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 50
+
+  responses:
+    BadRequest:
+      description: 请求体或参数非法
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: |
+        凭据缺失、格式错误、未知或用户/密钥被禁用。
+        管理面与用户面文案为 `missing or invalid bearer token` / `user is disabled`；
+        数据面为 `missing API key` / `invalid API key`。
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Forbidden:
+      description: 凭据有效但角色不足（管理面要求 `role=admin`）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: 目标资源不存在
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Conflict:
+      description: 资源存在引用冲突（如删除仍被模型引用的凭据）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InternalError:
+      description: 服务内部错误
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    QuotaExceeded:
+      description: 配额超限（状态码可配置为 429 或 403，默认 429），响应带 `Retry-After` 头
+      headers:
+        Retry-After:
+          description: 建议重试等待秒数
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    BodyTooLarge:
+      description: 请求体超过 1 MiB（直接拒绝、不截断）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    AnthropicBadRequest:
+      description: 请求非法（`invalid_request_error`）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AnthropicErrorResponse'
+    AnthropicUnauthorized:
+      description: 凭据缺失或无效（`authentication_error`）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AnthropicErrorResponse'
+    AnthropicQuotaExceeded:
+      description: 配额超限（`rate_limit_error`，默认 429），响应带 `Retry-After` 头
+      headers:
+        Retry-After:
+          description: 建议重试等待秒数
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AnthropicErrorResponse'
+    AnthropicBodyTooLarge:
+      description: 请求体超过 1 MiB（`invalid_request_error`，直接拒绝、不截断）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AnthropicErrorResponse'
+    AnthropicInternalError:
+      description: 服务内部错误（`api_error`）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AnthropicErrorResponse'
+    AnthropicUpstreamError:
+      description: 无法连接上游或流式不可用（`api_error`，502）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AnthropicErrorResponse'
+
+  schemas:
+    # ------------------------------------------------------------------
+    # 通用
+    # ------------------------------------------------------------------
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+      required: [status]
+
+    Ok:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          example: true
+      required: [ok]
+
+    ErrorResponse:
+      type: object
+      description: 统一错误体（`code` 等于 HTTP 状态码）。
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+            type:
+              type: string
+              example: error
+            code:
+              type: integer
+              description: 等于 HTTP 状态码
+          required: [message, type, code]
+      required: [error]
+
+    AnthropicErrorResponse:
+      type: object
+      description: Anthropic 风格错误体（`POST /v1/messages`）。
+      properties:
+        type:
+          type: string
+          enum: [error]
+        error:
+          type: object
+          properties:
+            type:
+              type: string
+              enum: [authentication_error, invalid_request_error, rate_limit_error, api_error]
+            message:
+              type: string
+          required: [type, message]
+      required: [type, error]
+
+    # ------------------------------------------------------------------
+    # 数据面
+    # ------------------------------------------------------------------
+    ChatCompletionRequest:
+      type: object
+      description: |
+        OpenAI Chat Completions 请求。网关只读取并改写下列字段，其余字段原样转发（因此不做封闭约束）。
+      properties:
+        model:
+          type: string
+          description: 目标模型；须匹配密钥绑定的启用模型，缺省用 `primary` 绑定。支持 `provider/model_id` 前缀（如 `qcloudlkeap/deepseek-v3.2`），前缀也可为保存绑定时生成的拼接形态 `{provider}-{model_id}`（如 `hatchery-glm-4-plus/glm-4-plus`）
+        messages:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        stream:
+          type: boolean
+          default: false
+        max_tokens:
+          type: integer
+          description: 密钥 `max_tokens > 0` 时会被截断到该上限
+        max_completion_tokens:
+          type: integer
+          description: 同上
+      required: [messages]
+      additionalProperties: true
+
+    ChatCompletionResponse:
+      type: object
+      description: 上游响应体原样透传（此处仅示意常见 OpenAI 结构）。
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          example: chat.completion
+        created:
+          type: integer
+          format: int64
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        usage:
+          type: object
+          additionalProperties: true
+      additionalProperties: true
+
+    OpenAIModelList:
+      type: object
+      properties:
+        object:
+          type: string
+          enum: [list]
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                description: 上游 `model_id`（小写）
+              object:
+                type: string
+                enum: [model]
+              created:
+                type: integer
+                format: int64
+                description: 请求时刻的 Unix 秒（非存储时间戳）
+              owned_by:
+                type: string
+                description: 模型的 `provider`
+            required: [id, object, created, owned_by]
+      required: [object, data]
+
+    AnthropicMessagesRequest:
+      type: object
+      description: |
+        Anthropic Messages 请求。`model` 与 `max_tokens` 必填；`content` 支持字符串或内容块数组；
+        未知字段被忽略（因此不做封闭约束）。
+      properties:
+        model:
+          type: string
+        max_tokens:
+          type: integer
+          minimum: 1
+        messages:
+          type: array
+          items:
+            type: object
+            properties:
+              role:
+                type: string
+                enum: [user, assistant]
+              content:
+                description: 字符串或内容块数组（`text` / `image` / `tool_use` / `tool_result`）
+                oneOf:
+                  - type: string
+                  - type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+            required: [role, content]
+        system:
+          description: 系统提示（字符串或内容块数组）
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: object
+                additionalProperties: true
+        stream:
+          type: boolean
+          default: false
+        tools:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        tool_choice:
+          type: object
+          additionalProperties: true
+        stop_sequences:
+          type: array
+          items:
+            type: string
+        temperature:
+          type: number
+        top_p:
+          type: number
+        metadata:
+          type: object
+          additionalProperties: true
+      required: [model, max_tokens, messages]
+      additionalProperties: true
+
+    AnthropicUsage:
+      type: object
+      properties:
+        input_tokens:
+          type: integer
+        output_tokens:
+          type: integer
+        cache_read_input_tokens:
+          type: integer
+          description: 仅当上游提供缓存命中 token 数时输出
+      required: [input_tokens, output_tokens]
+
+    AnthropicMessagesResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          description: 以 `msg_` 开头
+        type:
+          type: string
+          enum: [message]
+        role:
+          type: string
+          enum: [assistant]
+        model:
+          type: string
+          description: 客户端请求的模型名
+        content:
+          type: array
+          items:
+            type: object
+            description: 文本块 `{"type":"text","text":…}` 或工具调用块 `{"type":"tool_use","id","name","input"}`
+            additionalProperties: true
+        stop_reason:
+          type: string
+          enum: [end_turn, max_tokens, tool_use]
+        stop_sequence:
+          type: string
+          nullable: true
+        usage:
+          $ref: '#/components/schemas/AnthropicUsage'
+      required: [id, type, role, model, content, stop_reason, usage]
+
+    # ------------------------------------------------------------------
+    # 管理面：模型
+    # ------------------------------------------------------------------
+    Model:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: uint
+        provider:
+          type: string
+        model_id:
+          type: string
+        model_name:
+          type: string
+        url:
+          type: string
+        model_type:
+          type: string
+          enum: [openai-completions, anthropic-messages]
+        custom_http_headers:
+          type: object
+          nullable: true
+          additionalProperties:
+            type: string
+        quota_day:
+          type: integer
+          description: 模型日配额上限；`-1` 表示不限
+        enabled:
+          type: boolean
+        user_key_required:
+          type: boolean
+          description: |
+            用户自备 Key（BYOK）模式：模型不保存共享密钥，转发密钥取密钥绑定行；
+            创建时确定，不可变更。
+        credential_id:
+          type: integer
+          format: uint
+          description: 引用的凭据 ID；`0` 表示未引用（直接使用 `api_key`）
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required: [id, provider, model_id, model_name, url, model_type, quota_day, enabled, user_key_required, credential_id, created_at, updated_at]
+
+    ModelList:
+      type: object
+      properties:
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/Model'
+      required: [models]
+
+    ModelCreateRequest:
+      type: object
+      properties:
+        provider:
+          type: string
+        model_id:
+          type: string
+        model_name:
+          type: string
+        url:
+          type: string
+        api_key:
+          type: string
+          description: 上游凭据（不会出现在任何响应中）
+        model_type:
+          type: string
+          enum: [openai-completions, anthropic-messages]
+        custom_http_headers:
+          type: object
+          nullable: true
+          additionalProperties:
+            type: string
+        quota_day:
+          type: integer
+          default: -1
+        enabled:
+          type: boolean
+          default: true
+        user_key_required:
+          type: boolean
+          default: false
+          description: 自备 Key（BYOK）模式；不可与 `api_key`/`credential_id` 同时出现，创建后不可变更
+        credential_id:
+          type: integer
+          format: uint
+          description: 引用凭据 ID（须存在）
+      required: [model_id, url, model_type]
+
+    ModelUpdateRequest:
+      type: object
+      description: 局部更新；仅出现的字段被修改。`api_key` 为空串时视为不修改。
+      properties:
+        provider:
+          type: string
+        model_id:
+          type: string
+        model_name:
+          type: string
+        url:
+          type: string
+        api_key:
+          type: string
+        model_type:
+          type: string
+          enum: [openai-completions, anthropic-messages]
+        custom_http_headers:
+          type: object
+          nullable: true
+        quota_day:
+          type: integer
+        enabled:
+          type: boolean
+        user_key_required:
+          type: boolean
+          description: 不可变更；与当前值不同返回 400。自备 Key 模型不得携带共享密钥。
+        credential_id:
+          type: integer
+          format: uint
+
+    ConnectivityResult:
+      type: object
+      description: |
+        连通性探测结果（HTTP 状态码恒为 200）。
+        `ok=true` 时给出 `latency_ms`；`ok=false` 时给出 `error_kind` 与 `message`。
+      properties:
+        ok:
+          type: boolean
+        latency_ms:
+          type: integer
+          description: 一次最小对话请求的往返毫秒数（`ok=true` 时存在）
+        error_kind:
+          type: string
+          description: 失败原因枚举（`ok=false` 时存在）
+          enum: [network_unreachable, invalid_api_key, forbidden, rate_limited, upstream_server, upstream_client]
+        message:
+          type: string
+          description: 人类可读的失败原因（`ok=false` 时存在）
+      required: [ok]
+
+    # ------------------------------------------------------------------
+    # 管理面：凭据
+    # ------------------------------------------------------------------
+    SecretItem:
+      type: object
+      description: 凭据中的单条密钥项；读取时 `value` 恒为掩码。
+      properties:
+        key:
+          type: string
+          description: 请求头名
+        value:
+          type: string
+          description: 掩码值（长度 > 4 时保留首 2 + `*`*(n-4) + 末 2；更短时整体为 `*`）
+        location:
+          type: string
+          enum: [header]
+          default: header
+          description: 密钥位置，目前仅支持 `header`
+      required: [key, value, location]
+
+    Credential:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: uint
+        name:
+          type: string
+        description:
+          type: string
+        secrets:
+          type: array
+          items:
+            $ref: '#/components/schemas/SecretItem'
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required: [id, name, description, secrets, enabled, created_at, updated_at]
+
+    CredentialList:
+      type: object
+      properties:
+        credentials:
+          type: array
+          items:
+            $ref: '#/components/schemas/Credential'
+      required: [credentials]
+
+    CredentialCreateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          description: 必填，去空白后非空
+        description:
+          type: string
+        secrets:
+          type: array
+          items:
+            $ref: '#/components/schemas/SecretItem'
+        enabled:
+          type: boolean
+          default: true
+      required: [name]
+
+    CredentialUpdateRequest:
+      type: object
+      description: 局部更新；`secrets` 出现时整体替换，不传则保持不变。
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        secrets:
+          type: array
+          items:
+            $ref: '#/components/schemas/SecretItem'
+        enabled:
+          type: boolean
+
+    # ------------------------------------------------------------------
+    # 管理面：webhook
+    # ------------------------------------------------------------------
+    Webhook:
+      type: object
+      description: webhook 订阅；`secret` 只写不读回，响应中恒为掩码。
+      properties:
+        id:
+          type: integer
+          format: uint
+        name:
+          type: string
+        url:
+          type: string
+          format: uri
+          description: 仅 `http`/`https`
+        secret:
+          type: string
+          description: 掩码值（只写不读回）
+        event_types:
+          type: array
+          items:
+            type: string
+          description: 订阅的事件类型；空数组表示订阅全部
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required: [id, name, url, secret, event_types, enabled, created_at, updated_at]
+
+    WebhookList:
+      type: object
+      properties:
+        webhooks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Webhook'
+      required: [webhooks]
+
+    WebhookCreateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        url:
+          type: string
+          format: uri
+          description: 必填，必须是可解析的 `http`/`https` 地址
+        secret:
+          type: string
+          description: 用于 HMAC-SHA256 签名；不回读
+        event_types:
+          type: array
+          items:
+            type: string
+          description: 空数组或省略表示订阅全部
+        enabled:
+          type: boolean
+          default: true
+      required: [url]
+
+    WebhookUpdateRequest:
+      type: object
+      description: 局部更新；`secret` 为空串表示保持原值。
+      properties:
+        name:
+          type: string
+        url:
+          type: string
+          format: uri
+        secret:
+          type: string
+          description: 空串 = 保持不变（字段不可读回，无法用空值清空）
+        event_types:
+          type: array
+          items:
+            type: string
+        enabled:
+          type: boolean
+
+    Delivery:
+      type: object
+      description: 一次 webhook 投递记录。
+      properties:
+        id:
+          type: integer
+          format: uint
+        webhook_id:
+          type: integer
+          format: uint
+        event_type:
+          type: string
+        status:
+          type: string
+          enum: [pending, success, failed]
+        attempts:
+          type: integer
+          description: 已尝试次数（至多 3）
+        last_status:
+          type: integer
+          description: 最后一次尝试的 HTTP 状态码；网络错误为 0
+        last_error:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required: [id, webhook_id, event_type, status, attempts, last_status, last_error, created_at, updated_at]
+
+    DeliveryList:
+      type: object
+      properties:
+        deliveries:
+          type: array
+          items:
+            $ref: '#/components/schemas/Delivery'
+        total:
+          type: integer
+        page:
+          type: integer
+        page_size:
+          type: integer
+      required: [deliveries, total, page, page_size]
+
+    # ------------------------------------------------------------------
+    # 管理面：密钥
+    # ------------------------------------------------------------------
+    Binding:
+      type: object
+      properties:
+        ai_model_id:
+          type: integer
+          format: uint
+        model_id:
+          type: string
+        model_name:
+          type: string
+        provider:
+          type: string
+        role:
+          type: string
+          enum: [primary, fallback]
+        sort_order:
+          type: integer
+        has_key:
+          type: boolean
+          description: 是否已配置绑定级上游密钥（仅 `user_key_required` 模型需要；值本身永不返回）
+      required: [ai_model_id, model_id, model_name, provider, role, sort_order, has_key]
+
+    Key:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: uint
+        name:
+          type: string
+        user_id:
+          type: integer
+          format: uint
+        group_id:
+          type: integer
+          format: uint
+        proxy_token_prefix:
+          type: string
+          description: 展示前缀，形如 `sk-abcd1234…wxyz`
+        max_tokens:
+          type: integer
+          description: 请求侧 `max_tokens` 上限；`<= 0` 表示不限
+        token_quota_rules:
+          type: string
+          description: 密钥级周期配额（规范化规则 JSON）；空串 = 无密钥级限制。用户面只读
+        enabled:
+          type: boolean
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 可选有效期（UTC）；null = 永不过期
+        expired_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 首次因过期被拒绝的观测时间；null = 未发生
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        bindings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Binding'
+        token:
+          type: string
+          description: 一次性明文，仅在创建与 rotate 响应中出现
+      required: [id, name, user_id, group_id, proxy_token_prefix, max_tokens, token_quota_rules, enabled, created_at, updated_at, bindings]
+
+    KeyList:
+      type: object
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/Key'
+      required: [keys]
+
+    BindingRequest:
+      type: object
+      properties:
+        ai_model_id:
+          type: integer
+          format: uint
+        role:
+          type: string
+          enum: [primary, fallback]
+        sort_order:
+          type: integer
+          default: 0
+        api_key:
+          type: string
+          description: 绑定级上游密钥（仅 `user_key_required` 模型生效；加密落库、不回显；随 bindings 整体替换）
+      required: [ai_model_id, role]
+
+    KeyCreateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        user_id:
+          type: integer
+          format: uint
+          description: 必须引用已存在用户
+        group_id:
+          type: integer
+          format: uint
+          default: 0
+        max_tokens:
+          type: integer
+          default: 0
+        token_quota_rules:
+          type: string
+          description: 密钥级周期配额（规则数组 JSON，会校验与规范化）；空串 = 无密钥级限制
+        expires_at:
+          type: string
+          nullable: true
+          description: 可选有效期（RFC 3339）；缺省/null = 永不过期
+        bindings:
+          type: array
+          description: 非空时必须恰好一个 `primary`
+          items:
+            $ref: '#/components/schemas/BindingRequest'
+      required: [user_id]
+
+    KeyUpdateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        max_tokens:
+          type: integer
+        token_quota_rules:
+          type: string
+          description: 空串清除密钥级配额；否则必须是合法规则数组（校验 + 规范化）
+        enabled:
+          type: boolean
+        expires_at:
+          type: string
+          nullable: true
+          description: RFC3339 = 设置（并清空 expired_at）；null = 清除；非法值 400
+        bindings:
+          type: array
+          description: 出现时整体替换（`[]` 清空）
+          items:
+            $ref: '#/components/schemas/BindingRequest'
+
+    # ------------------------------------------------------------------
+    # 管理面：用户 / 分组 / 设置
+    # ------------------------------------------------------------------
+    User:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: uint
+        username:
+          type: string
+        role:
+          type: string
+          enum: [admin, user]
+        group_id:
+          type: integer
+          format: uint
+        api_token_prefix:
+          type: string
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        token:
+          type: string
+          description: 一次性明文访问 token，仅在创建与 rotate 响应中出现
+      required: [id, username, role, group_id, api_token_prefix, enabled, created_at, updated_at]
+
+    UserList:
+      type: object
+      properties:
+        users:
+          type: array
+          items:
+            $ref: '#/components/schemas/User'
+      required: [users]
+
+    UserCreateRequest:
+      type: object
+      properties:
+        username:
+          type: string
+        role:
+          type: string
+          enum: [admin, user]
+          default: user
+        group_id:
+          type: integer
+          format: uint
+          default: 0
+        enabled:
+          type: boolean
+          default: true
+
+    UserUpdateRequest:
+      type: object
+      properties:
+        username:
+          type: string
+        role:
+          type: string
+          enum: [admin, user]
+        group_id:
+          type: integer
+          format: uint
+        enabled:
+          type: boolean
+
+    Group:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: uint
+        name:
+          type: string
+        token_quota_rules:
+          type: string
+          description: |
+            配额规则 JSON **文本**：空串表示未配置（回退全局默认），`"[]"` 表示显式不限，
+            其余为经校验与规范化后的规则数组。
+        global_token_quota_rules:
+          type: string
+          description: |
+            组级全局配额覆盖：空串 = 未配置（回退站点规则与 `global_quota_scope`）；
+            `"[]"` = 显式不限；否则该组按自身规则、固定以组用量判定。
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required: [id, name, token_quota_rules, global_token_quota_rules, created_at, updated_at]
+
+    GroupList:
+      type: object
+      properties:
+        user_groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/Group'
+      required: [user_groups]
+
+    GroupCreateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        token_quota_rules:
+          type: string
+          description: 非空时必须是合法规则 JSON 数组
+        global_token_quota_rules:
+          type: string
+          description: 可选组级全局配额覆盖；非空时必须是合法规则 JSON 数组
+
+    GroupUpdateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        token_quota_rules:
+          type: string
+        global_token_quota_rules:
+          type: string
+          description: 空串清除组级覆盖
+
+    Settings:
+      type: object
+      properties:
+        default_token_quota_rules:
+          type: string
+          description: 全局默认用户配额规则 JSON 文本（默认 `"[]"`）
+        global_token_quota_rules:
+          type: string
+          description: 全站/按组全局配额规则 JSON 文本（默认 `"[]"`）
+        global_quota_scope:
+          type: string
+          enum: [site, group]
+          default: site
+        user_key_limit:
+          type: integer
+          default: 5
+          description: 每用户自助密钥数量上限；`0` = 不限
+      required: [default_token_quota_rules, global_token_quota_rules, global_quota_scope, user_key_limit]
+
+    SettingsUpdateRequest:
+      type: object
+      properties:
+        default_token_quota_rules:
+          type: string
+          description: 必须是合法 JSON 数组文本（拒绝空串与 `null`）
+        global_token_quota_rules:
+          type: string
+        global_quota_scope:
+          type: string
+          enum: [site, group]
+        user_key_limit:
+          type: integer
+          minimum: 0
+          description: 必须 `>= 0`；`0` = 不限
+
+    # ------------------------------------------------------------------
+    # 用量
+    # ------------------------------------------------------------------
+    UsageSummaryRow:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date-time
+          description: 仅 `group_by=date` 时出现（业务时区当日 00:00 的 UTC 时刻）
+        user_id:
+          type: integer
+          format: uint
+        api_key_id:
+          type: integer
+          format: uint
+        ai_model_id:
+          type: integer
+          format: uint
+        group_id:
+          type: integer
+          format: uint
+        prompt_tokens:
+          type: integer
+          format: int64
+        completion_tokens:
+          type: integer
+          format: int64
+        total_tokens:
+          type: integer
+          format: int64
+        prompt_cache_read_tokens:
+          type: integer
+          format: int64
+        prompt_cache_write_tokens:
+          type: integer
+          format: int64
+        request_count:
+          type: integer
+          format: int64
+      required: [prompt_tokens, completion_tokens, total_tokens, prompt_cache_read_tokens, prompt_cache_write_tokens, request_count]
+
+    UsageSummary:
+      type: object
+      properties:
+        group_by:
+          type: string
+          enum: [date, model, key, user, group]
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/UsageSummaryRow'
+      required: [group_by, rows]
+
+    UsageLog:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: uint
+        api_key_id:
+          type: integer
+          format: uint
+        user_id:
+          type: integer
+          format: uint
+        group_id:
+          type: integer
+          format: uint
+        ai_model_id:
+          type: integer
+          format: uint
+        model:
+          type: string
+          description: 解析命中的上游模型 ID
+        provider:
+          type: string
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+        prompt_cache_read_tokens:
+          type: integer
+        prompt_cache_write_tokens:
+          type: integer
+        status_code:
+          type: integer
+        latency:
+          type: integer
+          description: 请求耗时（毫秒）
+        created_at:
+          type: string
+          format: date-time
+      required: [id, api_key_id, user_id, group_id, ai_model_id, model, provider, prompt_tokens, completion_tokens, total_tokens, status_code, latency, created_at]
+
+    UsageLogs:
+      type: object
+      properties:
+        logs:
+          type: array
+          items:
+            $ref: '#/components/schemas/UsageLog'
+        total:
+          type: integer
+          format: int64
+        page:
+          type: integer
+        page_size:
+          type: integer
+      required: [logs, total, page, page_size]
+
+    # ------------------------------------------------------------------
+    # 用户面
+    # ------------------------------------------------------------------
+    UserKeyCreateRequest:
+      type: object
+      description: |
+        自助密钥创建。`bindings` 非空时必须恰好一个 `primary`，且每个模型都必须在
+        「该用户名下任意已有密钥出现过的模型」集合内。
+      properties:
+        name:
+          type: string
+        max_tokens:
+          type: integer
+          default: 0
+          description: 请求侧上限；`<= 0` 表示不封顶
+        bindings:
+          type: array
+          items:
+            $ref: '#/components/schemas/BindingRequest'
+
+    UserKeyUpdateRequest:
+      type: object
+      description: 局部更新；`bindings` 出现时整体替换并重新做模型范围校验。
+      properties:
+        name:
+          type: string
+        max_tokens:
+          type: integer
+        enabled:
+          type: boolean
+        bindings:
+          type: array
+          items:
+            $ref: '#/components/schemas/BindingRequest'
+
+    Me:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: uint
+        username:
+          type: string
+        role:
+          type: string
+          enum: [admin, user]
+        group_id:
+          type: integer
+          format: uint
+        group_name:
+          type: string
+          description: 分组名；未分组或分组已删除时为空串
+      required: [id, username, role, group_id, group_name]
+
+    RuleUsage:
+      type: object
+      properties:
+        rule_index:
+          type: integer
+        mode:
+          type: string
+          enum: [day, month, year, custom]
+        limit:
+          type: integer
+          description: '`-1` 表示参与窗口计算但不限用量'
+        used:
+          type: integer
+          format: int64
+        active:
+          type: boolean
+          description: 规则当前是否生效
+        period_start:
+          type: integer
+          format: int64
+          nullable: true
+          description: 窗口起点（Unix 秒）
+        period_end:
+          type: integer
+          format: int64
+          nullable: true
+          description: 窗口终点（Unix 秒）；空表示无终止
+      required: [rule_index, mode, limit, used, active]
+
+    QuotaView:
+      type: object
+      properties:
+        user_id:
+          type: integer
+          format: uint
+        usages:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuleUsage'
+      required: [user_id, usages]
+
+    # ------------------------------------------------------------------
+    # 存量导入
+    # ------------------------------------------------------------------
+    ImportRequest:
+      type: object
+      description: 一次导入的条目集合；处理顺序固定为 `user_groups → users → models → keys`。
+      properties:
+        dry_run:
+          type: boolean
+          default: false
+          description: '`true` 时只返回计划，不写库'
+        user_groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImportGroup'
+        users:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImportUser'
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImportModel'
+        keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImportKey'
+
+    ImportGroup:
+      type: object
+      properties:
+        name:
+          type: string
+          description: 幂等键
+        token_quota_rules:
+          type: string
+          description: 非空时必须是合法规则 JSON 数组
+
+    ImportUser:
+      type: object
+      properties:
+        name:
+          type: string
+          description: 幂等键
+        role:
+          type: string
+          enum: [admin, user]
+          default: user
+        group:
+          type: string
+          description: 分组名（按名引用）；非空时须能解析到已有或本次导入的分组
+
+    ImportModel:
+      type: object
+      properties:
+        provider:
+          type: string
+        model_id:
+          type: string
+        model_name:
+          type: string
+        url:
+          type: string
+        api_key:
+          type: string
+        model_type:
+          type: string
+          enum: [openai-completions, anthropic-messages]
+        quota_day:
+          type: integer
+          default: -1
+        enabled:
+          type: boolean
+          default: true
+      description: 幂等键为 `(provider, model_id)`。
+
+    ImportKey:
+      type: object
+      properties:
+        name:
+          type: string
+        user:
+          type: string
+          description: 属主用户名（按名引用）
+        group:
+          type: string
+          description: 分组名（按名引用，可省略）
+        max_tokens:
+          type: integer
+          default: 0
+        token:
+          type: string
+          description: 明文数据面密钥；导入时立即哈希，明文不落库/不回显
+        bindings:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImportBinding'
+      description: 幂等键为 `token` 哈希。
+
+    ImportBinding:
+      type: object
+      properties:
+        model:
+          type: string
+          description: 按 `model_id` 引用已有或本次导入的模型
+        role:
+          type: string
+          enum: [primary, fallback]
+        api_key:
+          type: string
+          description: 可选绑定级（自备 Key）密钥；加密落库
+      required: [model, role]
+
+    ImportDetail:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: [group, user, model, key]
+        ref:
+          type: string
+          description: 非敏感标识（名字 / `provider/model_id` / token 展示前缀）
+        action:
+          type: string
+          enum: [created, skipped, error]
+        message:
+          type: string
+          description: 仅 `action=error` 时给出原因
+      required: [kind, ref, action]
+
+    ImportSummary:
+      type: object
+      properties:
+        created:
+          type: integer
+        skipped:
+          type: integer
+        errors:
+          type: integer
+      required: [created, skipped, errors]
+
+    ImportResponse:
+      type: object
+      properties:
+        dry_run:
+          type: boolean
+        summary:
+          $ref: '#/components/schemas/ImportSummary'
+        details:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImportDetail'
+      required: [dry_run, summary, details]

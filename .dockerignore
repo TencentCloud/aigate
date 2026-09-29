@@ -1,0 +1,35 @@
+# Build context trimming: keep only the sources and go.mod needed to compile ./cmd/aigate.
+# Exclude VCS metadata, build artifacts, OpenSpec change records, docs, and tests.
+
+# Version control
+.git/
+.gitignore
+
+# Build artifacts and local data
+bin/
+*.exe
+*.test
+*.out
+coverage.out
+*.db
+*.db-shm
+*.db-wal
+
+# Change records (not build inputs)
+openspec/
+
+# Docs and tests
+docs/
+test/
+*.md
+
+# Editor / local tool config
+.codebuddy/
+.ci/
+.idea/
+.vscode/
+.DS_Store
+
+# Container files themselves
+Dockerfile
+.dockerignore

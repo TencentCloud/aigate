@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="260" height="96" viewBox="0 0 260 96" fill="none" role="img" aria-label="Tencent Cloud AIGate">
+  <defs>
+    <linearGradient id="lg" x1="12" y1="12" x2="84" y2="84" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0052D9"/>
+      <stop offset="1" stop-color="#00A4FF"/>
+    </linearGradient>
+  </defs>
+  <rect x="12" y="12" width="72" height="72" rx="20" fill="url(#lg)"/>
+  <g stroke="#FFFFFF" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M28 38 H58"/>
+    <path d="M50 28 L62 38 L50 48"/>
+    <path d="M68 58 H38"/>
+    <path d="M46 48 L34 58 L46 68"/>
+  </g>
+  <text x="102" y="36" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="600" fill="#64748B" letter-spacing="0.2">Tencent Cloud</text>
+  <text x="102" y="72" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="34" font-weight="700" fill="#0F172A" letter-spacing="-0.8">AIGate</text>
+</svg>

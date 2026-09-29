@@ -1,0 +1,25 @@
+# Build artifacts
+/bin/
+*.exe
+*.test
+*.out
+coverage.out
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local database (SQLite)
+*.db
+*.db-shm
+*.db-wal
+
+# Editors / system
+.DS_Store
+.idea/
+.vscode/
+
+# Local-only process artifacts (kept on disk, not published)
+/openspec/
+/.codebuddy/
