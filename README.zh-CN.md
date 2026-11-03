@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="Tencent Cloud AIGate" width="360">
+  <img src="assets/logo.svg?v=20261103" alt="Tencent Cloud AIGate" width="360">
 </p>
 
 <h1 align="center">路由、管控与记账每一次模型调用，只需一个二进制</h1>
