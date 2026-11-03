@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg?v=20261103" alt="Tencent Cloud AIGate" width="360">
+  <img src="assets/logo.svg" alt="Tencent Cloud AIGate" width="360">
 </p>
 
 <h1 align="center">Route, control, and account for every model call — in one binary</h1>
