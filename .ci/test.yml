@@ -1,0 +1,23 @@
+version: v2.0
+
+on:
+  mr: ["*"]
+  push: ["master"]
+
+jobs:
+  test:
+    runs-on:
+      pool-name: docker
+      container:
+        image: golang:1.24
+    steps:
+    - checkout: self
+      with:
+         enableGitLfs: false
+    - run: |
+        set -e
+        go version
+        test -z "$(gofmt -l cmd internal test)"
+        go build ./...
+        go vet ./...
+        go test -race ./... -count=1
