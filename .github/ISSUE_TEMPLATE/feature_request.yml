@@ -1,0 +1,45 @@
+name: Feature request
+description: Propose a capability or integration for AIGate
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what blocks you today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior, API, or configuration you have in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing tools, workarounds, or designs you evaluated.
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - Data plane (proxy / protocol)
+        - Admin or user API
+        - Quotas and usage accounting
+        - Credentials and security
+        - Deployment / operations
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and discussions first.
+          required: true

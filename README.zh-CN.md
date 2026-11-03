@@ -2,46 +2,107 @@
   <img src="assets/logo.svg" alt="Tencent Cloud AIGate" width="360">
 </p>
 
-<h1 align="center">路由、管控与记账每一次模型调用，只需一个二进制</h1>
+<h1 align="center">一个二进制，路由、管控、记账每一次模型调用。</h1>
 
 <p align="center">
   <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
 <p align="center">
+  <a href="https://github.com/TencentCloud/aigate/actions/workflows/ci.yml"><img src="https://github.com/TencentCloud/aigate/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"></a>
   <a href="go.mod"><img src="https://img.shields.io/badge/Go-1.24%2B-00ADD8.svg" alt="Go 1.24+"></a>
   <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-v0.1.0-informational.svg" alt="v0.1.0"></a>
 </p>
 
-**Tencent Cloud AIGate 是自托管的企业级 LLM API 网关——纯 API 服务，无前端。**
-它把 OpenAI 格式与 Anthropic 格式的请求转发到 OpenAI 兼容端点或 Anthropic
-Messages API，逐请求记录用量、执行 token 配额，并通过 webhook 投递签名事件。
+**腾讯云 AIGate 是自托管、单二进制的 LLM 网关。** 它把 OpenAI 与 Anthropic
+统一到一个入口，并把企业真正需要的能力——按 Key 的模型路由、四级 token 配额、
+BYOK、用量记账、签名 Webhook、SSRF 加固——做成默认行为，而不是附加项。
 
-**来历。** AIGate 由 [ClawPro](https://cloud.tencent.com/document/product/213/129156)
-孵化——腾讯云开箱即用的一站式企业 AI 智能体管控平台。ClawPro 帮助企业零代码、
-分钟级为全员规模化部署安全可控的专属数字助手：成员与权限集中管理、模型与知识库
-配置、主流 IM 通道一键接入、资源与成本实时监控。
+- **保留你的 SDK，也保留你的上游。** 客户端可用 OpenAI 或 Anthropic 协议，
+  上游同样两种皆可；协议不一致时网关转换，一致时原生直通。
+- **不用平台团队也能管控。** 模型绑定、配额、用量记账、密钥生命周期和事件
+  Webhook 全部内置；不需要维护代理集群或边车。
+- **像 CLI 一样运行，而不是像平台。** 单个静态二进制或非 root 容器；笔记本用
+  SQLite，生产用 MySQL。
 
-正是企业场景的打磨塑造了这个网关：AIGate 是 ClawPro 的模型接入层，多级配额、
-按密钥的模型绑定、完整用量记账、出站安全加固等企业级要求，都是它的默认能力而非
-附加项。它由经生产验证的 LLM proxy 抽取而来，行为对应已经跑过生产的请求模式与
-失败模式。完整的来历与设计理念见 [docs/why-aigate.zh-CN.md](docs/why-aigate.zh-CN.md)。
+## 快速开始
 
-**状态：** v0.1.0 —— 发布记录见 [CHANGELOG.md](CHANGELOG.md)，下一步计划见
-[docs/ROADMAP.zh-CN.md](docs/ROADMAP.zh-CN.md)。
+Docker 最快：
 
-<p align="center">
-  <img src="assets/architecture.svg" alt="客户端以 sk- 密钥发送 OpenAI 或 Anthropic 格式请求；网关负责鉴权、模型路由、配额、用量记账、webhook 事件与 SSRF 防护出站；上游为 OpenAI 兼容端点或 Anthropic Messages API" width="100%">
-</p>
+```bash
+docker run --rm -p 8080:8080 \
+  -e AIGATE_INIT_ADMIN_TOKEN=dev-admin-token \
+  -v aigate-data:/data \
+  ghcr.io/tencentcloud/aigate:0.1.0
+```
+
+想看完整闭环——建模型、建用户、发 Key，并通过本地 mock 上游完成一次对话，
+不需要任何外部 API Key：
+
+```bash
+./demo/quickstart.sh
+```
+
+或者从源码启动：
+
+```bash
+make run
+```
+
+完整配置、MySQL、凭据加密和容器说明见
+[docs/deploy.zh-CN.md](docs/deploy.zh-CN.md)。
 
 ## 为什么用 AIGate
 
-- **保留你的 SDK，也保留你的上游** —— 客户端可用 OpenAI 或 Anthropic 协议，
-  上游同样两种皆可；协议不一致时网关做转换，一致时原生直通。
-- **无需平台团队也能管控** —— 按密钥的模型绑定、三级配额、用量记账与事件
-  webhook 全部内置；不需要维护代理集群或边车。
-- **随处可跑** —— 单个静态二进制或非 root 容器；笔记本用 SQLite，生产用 MySQL。
+- **为模型访问而做，不是通用 API 网关。** 路由、配额、凭据、用量和 Webhook
+  都是一等概念，不是插件链上的补丁。
+- **从生产里抽出来。** AIGate 是
+  [ClawPro](https://cloud.tencent.com/document/product/213/129156) 的模型接入层，
+  行为对应已经跑过生产的请求模式和失败模式。
+- **刻意保持简单。** 没有 Web UI、没有 sidecar、没有代理集群；一个静态二进制，
+  SQLite 或 MySQL。
+
+## 什么情况下不该用 AIGate
+
+- 需要面向最终用户的门户或 Web 管理后台——AIGate 坚持 API-only。
+- 需要模型市场、转售或客户计费产品。
+- 需要 MCP 代理或 Agent 会话管理——这些属于相邻层。
+- 需要 Python 原生插件生态，且不想运行 Go 服务。
+
+## 与其它方案的关系
+
+| | AIGate | LiteLLM | One API | Kong / Envoy AI Gateway |
+|---|---|---|---|---|
+| 形态 | 单个 Go 二进制 / 容器 | Python 代理 + SDK | Go 服务 + Web UI | 通用网关 + 插件 |
+| 协议面 | OpenAI + Anthropic，入站与上游 | 广泛的厂商适配 | OpenAI 兼容 | 取决于插件 |
+| 配额 | 四级内置 | 预算 / 限流 | 用户 / 渠道配额 | 插件或配置 |
+| BYOK | 按 Key 绑定，加密落库 | 厂商 Key | 渠道 Key | 插件 |
+| UI | 无，纯 API | 管理 UI | Web UI | 独立 |
+| 适合 | 想自带治理、但不想养平台的团队 | Python 技术栈 | 多渠道 Key 分发 | 已有网关栈 |
+
+> 方向性对比，选型前请以各项目最新文档为准。AIGate 刻意做得更少：它是网关，
+> 不是平台。
+
+<p align="center">
+  <img src="assets/architecture.svg" alt="客户端以 sk- 密钥发送 OpenAI 或 Anthropic 格式请求；网关负责鉴权、模型路由、配额、用量记账、Webhook 事件与 SSRF 防护出站；上游为 OpenAI 兼容端点或 Anthropic Messages API" width="100%">
+</p>
+
+## 来历
+
+AIGate 由 [ClawPro](https://cloud.tencent.com/document/product/213/129156)
+孵化——腾讯云企业 AI 智能体管控平台。为整个组织做可控的模型接入，塑造了这个
+网关：多租户配额、按 Key 的模型绑定、完整用量记账和出站安全加固都是默认能力，
+不是附加项。完整故事见 [docs/why-aigate.zh-CN.md](docs/why-aigate.zh-CN.md)。
+
+## 从这里开始
+
+- [为什么做 AIGate](docs/why-aigate.zh-CN.md)
+- [API 参考](docs/API.zh-CN.md)
+- [部署](docs/deploy.zh-CN.md)
+- [路线图](docs/ROADMAP.zh-CN.md)
+- [贡献指南](CONTRIBUTING.md)
+- [安全策略](SECURITY.md)
 
 ## 特性
 
@@ -81,7 +142,7 @@ Messages API，逐请求记录用量、执行 token 配额，并通过 webhook �
   URL 校验、拨号时二次解析、重定向校验。
 - **单二进制与容器** —— 静态编译；多阶段 `Dockerfile` 以非 root 用户运行并带健康检查。
 
-## 快速开始（SQLite）
+## 从源码启动（SQLite）
 
 需要 Go 1.24+。
 
@@ -195,8 +256,8 @@ Docker 说明与上游 SSRF 策略见 [docs/deploy.zh-CN.md](docs/deploy.zh-CN.m
 
 ## 参与贡献
 
-欢迎在仓库提 Issue 或 MR。
+欢迎在仓库提 Issue 或 Pull Request。
 
 ## License
 
-Apache-2.0 —— 见 [LICENSE](LICENSE)。
+Apache-2.0 —— 见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。

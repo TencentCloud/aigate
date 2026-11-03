@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a reproducible problem with AIGate
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please remove API keys, upstream credentials,
+        customer data and internal hostnames from logs and screenshots.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Include the expected behavior and the actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Minimal commands, config, or a curl request that triggers the issue.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: AIGate version
+      placeholder: "0.1.0 / commit SHA"
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Docker
+        - Binary
+        - Built from source
+        - Kubernetes / Helm
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: database
+    attributes:
+      label: Database
+      options:
+        - SQLite
+        - MySQL
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Redact secrets before pasting.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and could not find a duplicate.
+          required: true
+        - label: I removed secrets and customer data from this report.
+          required: true

@@ -26,6 +26,7 @@ test/
 # Editor / local tool config
 .codebuddy/
 .ci/
+.github/
 .idea/
 .vscode/
 .DS_Store

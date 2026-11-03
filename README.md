@@ -2,54 +2,114 @@
   <img src="assets/logo.svg" alt="Tencent Cloud AIGate" width="360">
 </p>
 
-<h1 align="center">Route, control, and account for every model call — in one binary</h1>
+<h1 align="center">One binary. Every model call routed, governed, and accounted.</h1>
 
 <p align="center">
   <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
 <p align="center">
+  <a href="https://github.com/TencentCloud/aigate/actions/workflows/ci.yml"><img src="https://github.com/TencentCloud/aigate/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"></a>
   <a href="go.mod"><img src="https://img.shields.io/badge/Go-1.24%2B-00ADD8.svg" alt="Go 1.24+"></a>
   <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-v0.1.0-informational.svg" alt="v0.1.0"></a>
 </p>
 
-**Tencent Cloud AIGate is a self-hosted, enterprise-grade LLM API gateway — a pure API service with no web UI.**
-It forwards both OpenAI-format and Anthropic-format requests to either an
-OpenAI-compatible endpoint or the Anthropic Messages API, records per-request
-usage, enforces token quotas, and emits signed webhook events.
+**Tencent Cloud AIGate is a self-hosted, single-binary LLM gateway.** It puts
+OpenAI and Anthropic behind one endpoint and makes the enterprise requirements —
+per-key model routing, four-tier token quotas, BYOK, usage accounting, signed
+webhooks, SSRF-hardened egress — default behavior instead of add-ons.
 
-**Origin.** AIGate is incubated by [ClawPro](https://cloud.tencent.com/document/product/213/129156)
-— Tencent Cloud's one-stop enterprise AI agent management platform. ClawPro
-rolls secure, governed AI assistants out to an entire workforce in minutes — no
-code required — with centralized member permissions, model and knowledge-base
-configuration, one-click messenger channels, and real-time cost monitoring.
+- **Keep your SDK and your upstream.** Clients speak OpenAI or Anthropic;
+  upstreams can be either protocol. AIGate translates when they differ and
+  passes through natively when they match.
+- **Govern without a platform team.** Model bindings, quotas, usage accounting,
+  key lifecycle and event webhooks are built in. There is no proxy fleet or
+  sidecar to operate.
+- **Run it like a CLI, not a platform.** One static binary or a non-root
+  container; SQLite for a laptop, MySQL for production.
 
-Building that for enterprises is what shaped this gateway: AIGate is ClawPro's
-model-access layer, so enterprise requirements — multi-tenant quotas, per-key
-model bindings, complete usage accounting, hardened outbound access — are its
-defaults, not add-ons. Extracted from a production-verified LLM proxy, its
-behaviour reflects request patterns and failure modes that have already run in
-production. Read the full story and design principles:
-[docs/why-aigate.md](docs/why-aigate.md).
+## Quick start
 
-**Status:** v0.1.0 — see [CHANGELOG.md](CHANGELOG.md) for the release history
-and [docs/ROADMAP.md](docs/ROADMAP.md) for what is coming next.
+Docker is the fastest path:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e AIGATE_INIT_ADMIN_TOKEN=dev-admin-token \
+  -v aigate-data:/data \
+  ghcr.io/tencentcloud/aigate:0.1.0
+```
+
+For a self-contained end-to-end run — model, user, key and a chat completion
+through a local mock upstream, no external API key required:
+
+```bash
+./demo/quickstart.sh
+```
+
+Or build from source:
+
+```bash
+make run
+```
+
+Full configuration, MySQL, credential encryption and container details:
+[docs/deploy.md](docs/deploy.md).
+
+## Why AIGate
+
+- **Built for model access, not general API traffic.** Routing, quotas,
+  credentials, usage and webhooks are first-class concepts, not plugin chains.
+- **Production-extracted.** AIGate is the model-access layer of
+  [ClawPro](https://cloud.tencent.com/document/product/213/129156), so its
+  behavior reflects request patterns and failure modes that have already run in
+  production.
+- **Boring on purpose.** No web UI, no sidecars, no proxy fleet; a single static
+  binary with SQLite or MySQL.
+
+## When not to use AIGate
+
+- You need an end-user portal or a web admin UI — AIGate is an API-only service.
+- You need a model marketplace, resale or customer billing product.
+- You need MCP proxying or agent session management — those belong to adjacent
+  layers.
+- You need a Python-native plugin ecosystem and do not want a Go service.
+
+## How it compares
+
+| | AIGate | LiteLLM | One API | Kong / Envoy AI Gateway |
+|---|---|---|---|---|
+| Form factor | single Go binary / container | Python proxy + SDK | Go service + web UI | general gateway + plugins |
+| Protocol surface | OpenAI + Anthropic, ingress and upstream | broad provider adapters | OpenAI-compatible | plugin-dependent |
+| Quotas | four-tier built in | budgets / rate limits | user / channel quotas | plugin or config |
+| BYOK | per-key binding, encrypted at rest | provider keys | channel keys | plugin |
+| UI | none, API only | admin UI | web UI | separate |
+| Best fit | teams that want governance without a platform | Python-centric stacks | multi-channel key distribution | an existing gateway stack |
+
+> Directional comparison; check each project's current documentation before
+> choosing. AIGate deliberately does less: it is a gateway, not a platform.
 
 <p align="center">
   <img src="assets/architecture.svg" alt="Clients send OpenAI- or Anthropic-format requests with an sk- key; the gateway handles auth, model routing, quota, usage accounting, webhook events and SSRF-hardened egress; upstreams are an OpenAI-compatible endpoint or the Anthropic Messages API" width="100%">
 </p>
 
-## Why AIGate
+## Origin
 
-- **Keep your SDK, keep your upstream** — clients speak OpenAI or Anthropic, and
-  upstreams can be either protocol. The gateway translates when they differ and
-  passes through natively when they match.
-- **Control without a platform team** — per-key model bindings, three-level
-  quotas, usage accounting, and event webhooks are all built in; there is no
-  proxy fleet or sidecar to operate.
-- **Run it anywhere** — a single static binary or a non-root container; SQLite
-  for a laptop, MySQL for production.
+AIGate is incubated by [ClawPro](https://cloud.tencent.com/document/product/213/129156),
+Tencent Cloud's enterprise AI agent management platform. Building governed
+model access for an entire workforce is what shaped this gateway: multi-tenant
+quotas, per-key model bindings, complete usage accounting and hardened outbound
+access are defaults, not add-ons. The full story is in
+[docs/why-aigate.md](docs/why-aigate.md).
+
+## Start here
+
+- [Why AIGate](docs/why-aigate.md)
+- [API reference](docs/API.md)
+- [Deployment](docs/deploy.md)
+- [Roadmap](docs/ROADMAP.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
 
 ## Features
 
@@ -102,7 +162,7 @@ and [docs/ROADMAP.md](docs/ROADMAP.md) for what is coming next.
 - **Single binary and container** — static build; a multi-stage `Dockerfile`
   runs as a non-root user with a health check.
 
-## Quick start (SQLite)
+## Quick start from source (SQLite)
 
 Requires Go 1.24+.
 
@@ -229,9 +289,9 @@ Invalid configuration is rejected at startup rather than silently defaulted.
 
 ## Contributing
 
-Feedback and merge requests are welcome — open an issue or a merge request on
+Feedback and pull requests are welcome — open an issue or a pull request on
 the repository.
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
